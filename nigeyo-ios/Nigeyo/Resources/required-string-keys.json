@@ -399,6 +399,8 @@
     "regions.shortcuts.live-tsunami": {},
     "regions.shortcuts.help": {},
     "regions.registration.registered": {},
+    "regions.registration.retry": {},
+    "regions.registration.unsynced": {},
     "regions.registration.revoke": {},
     "regions.registration.unavailable": {},
     "regions.registration.device": {},

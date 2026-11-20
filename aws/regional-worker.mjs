@@ -1,12 +1,17 @@
 import { pathToFileURL } from "node:url";
+import { createServer } from "node:http";
+import { createHash } from "node:crypto";
 import { sensitiveHeaders } from "node:http2";
 import { setTimeout as delay } from "node:timers/promises";
 import { deviceFingerprint, disabledSubscription, loadActivityUpdate, loadLiveSubscription } from "./live-registration.mjs";
+import { installationStore } from "./installation-store.mjs";
+import { workerObservability } from "./worker-observability.mjs";
 import { createRegionalStateStore } from "./regional-state.mjs";
 import { RegionalMonitor } from "../server/monitoring/service.mjs";
 import { validSubscription } from "../server/monitoring/regions.mjs";
-import { loadAPNsSecret, providerToken, readConfig, sendToAPNs } from "./apns-training/index.mjs";
+import { loadAPNsSecret, providerToken, readConfig, resetAPNsConnection, sendToAPNs } from "./apns-training/index.mjs";
 
+import { classifyAPNs } from "./apns-training/transport.mjs";
 import { activityContent, buildActivityStart, sendActivity, validActivityRegistration } from "./apns-training/activity-push.mjs";
 
 const titles = {
@@ -34,116 +39,198 @@ export function buildRegionalPush(command, now = Date.now()) {
   const label = command.hazard === "earthquake" ? "緊急地震速報"
     : { Watch: "津波注意報", Warning: "津波警報", MajorWarning: "大津波警報" }[command.grade];
   const body = `登録地域（${regions}）に${label}が発表されました。気象庁・自治体の情報を確認してください。`;
+  const { delivery: _delivery, ...publicCommand } = command;
   return {
     expires,
     payload: {
       aps: { alert: { title, body }, sound: "default" },
       nigeyoType: "regional-alert",
       regionalAlert: JSON.stringify({
-        ...command, matches, sentAt: new Date(now).toISOString(), expiresAt: new Date(expires * 1000).toISOString(),
+        ...publicCommand, matches, sentAt: new Date(now).toISOString(), expiresAt: new Date(expires * 1000).toISOString(),
       }),
     },
   };
 }
 
-export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs, WebSocketImpl, now = Date.now, log = console.log, subscriptionSource, activityUpdateSource }) {
-  const config = readConfig(secret);
-  const devices = config.devices ?? [{ deviceToken: config.deviceToken, subscription: JSON.parse(secret).subscription }];
+function activityRequestId(commandId, channel) {
+  const bytes = createHash("sha256").update(commandId + ":" + channel).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join("-");
+}
+
+export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs, WebSocketImpl, now = Date.now, log = console.log, subscriptionSource, activityUpdateSource, registry, refreshSigningSecret }) {
+  let config = readConfig(secret, { signingOnly: !!registry });
+  const devices = registry ? [] : config.devices ?? [{ deviceToken: config.deviceToken, subscription: JSON.parse(secret).subscription }];
   const installations = new Map(devices.map((device) => [
     device.id ? `aws-device-${deviceFingerprint(device)}` : "aws-demo-device", device,
   ]));
   const subscriptions = new Map();
-  const monitor = new RegionalMonitor({ stateStore, WebSocketImpl, now: () => new Date(now()), log: (event) => log(event) });
+  const monitor = new RegionalMonitor({
+    stateStore, WebSocketImpl, now: () => new Date(now()), log,
+    alwaysConnect: !!registry,
+    durableDelivery: !!registry,
+    onEvent: registry ? async (item) => {
+      await refreshRegistry();
+      await monitor.ingest(item);
+    } : undefined,
+  });
   const inFlight = new Set();
-  const startedActivities = new Map();
-  const acceptedNotifications = new Map();
+  const waiting = [];
+  let activeDeliveries = 0;
+  let refreshedAt = now();
+  let refreshing;
   let token;
   let tokenIssuedAt;
 
   function dispatch(installation, device, command, fingerprint) {
     if (inFlight.has(command.commandId)) return;
     inFlight.add(command.commandId);
-    deliver(installation, device, command, fingerprint).catch(() => log("regional-apns-retry")).finally(() => inFlight.delete(command.commandId));
+    waiting.push({ installation, device, command, fingerprint });
+    drainDeliveries();
   }
 
-  async function deliver(installation, device, command, fingerprint) {
-    // A disable or region change must also invalidate queued pushes between polls.
-    const subscription = subscriptionSource ? await subscriptionSource(device) : device.subscription;
-    if (subscriptionSource && JSON.stringify(regionalSettings(subscription)) !== fingerprint) return;
-    if (!monitor.records[installation]?.pending.some((item) => item.commandId === command.commandId)) return;
+  function drainDeliveries() {
+    if (monitor.stopped) return;
+    const limit = registry ? 32 : Infinity;
+    while (activeDeliveries < limit && waiting.length) {
+      const { installation, device, command, fingerprint } = waiting.shift();
+      activeDeliveries++;
+      deliver(installation, device, command, fingerprint).catch(() => log("regional-apns-retry")).finally(() => {
+        inFlight.delete(command.commandId);
+        activeDeliveries--;
+        drainDeliveries();
+      });
+    }
+  }
 
-    const timestamp = now();
-    const push = buildRegionalPush(command, timestamp);
+  async function signingToken(timestamp) {
     const seconds = Math.floor(timestamp / 1000);
+    if (refreshSigningSecret && timestamp - refreshedAt >= 300_000) {
+      refreshing ??= (async () => {
+        try {
+          const { SecretString } = await refreshSigningSecret();
+          const next = readConfig(SecretString, { signingOnly: !!registry });
+          if (config.keyId !== next.keyId || config.teamId !== next.teamId || !config.key.equals(next.key)) {
+            token = undefined;
+            resetAPNsConnection();
+          }
+          config = next;
+        } catch {
+          log("regional-signing-refresh-failed");
+        } finally {
+          refreshedAt = now();
+          refreshing = undefined;
+        }
+      })();
+      await refreshing;
+    }
     if (!token || seconds - tokenIssuedAt >= 45 * 60) {
       token = providerToken(config, seconds);
       tokenIssuedAt = seconds;
     }
-    const activity = subscription?.activity;
-    for (const cache of [startedActivities, acceptedNotifications]) {
-      for (const [id, expiry] of cache) if (expiry <= seconds) cache.delete(id);
-    }
-    const shouldEnd = activityUpdateSource && validActivityRegistration(activity) &&
-      (command.status === "cancelled" || (command.hazard === "tsunami" && command.grade === "Watch" &&
-        Object.values(command.tsunamiAreas ?? {}).every((grade) => ["Watch", "Cancelled"].includes(grade))));
-    const withinEndWindow = Date.parse(command.issuedAt) + 120_000 > timestamp;
-    const ending = shouldEnd && withinEndWindow
-      ? endActivity(device, command, seconds, activity.language).catch(() => false)
-      : Promise.resolve(true);
-    if (!push || Buffer.byteLength(JSON.stringify(push.payload)) > 4096) {
-      if (push) log("regional-apns-payload-too-large");
-      if (await ending) await monitor.acknowledge(installation, command.commandId);
-      return;
-    }
-    const notification = acceptedNotifications.has(command.commandId) ? Promise.resolve(200) : send({
-      ":method": "POST",
-      ":path": `/3/device/${device.deviceToken}`,
-      "content-type": "application/json",
-      authorization: `bearer ${token}`,
-      [sensitiveHeaders]: ["authorization", ":path"],
-      "apns-topic": config.bundleId,
-      "apns-push-type": "alert",
-      "apns-priority": "10",
-      "apns-id": command.commandId,
-      "apns-collapse-id": command.commandId,
-      "apns-expiration": String(push.expires),
-    }, push.payload).catch(() => 503);
-    let activitySettled = true;
-    if (command.grade !== "Watch" && validActivityRegistration(activity) &&
-        !startedActivities.has(command.commandId)) {
-      const result = await sendActivity({ send, config, jwt: token, token: activity.token, expires: push.expires,
-        eventId: command.commandId,
-        payload: buildActivityStart({ hazard: command.hazard, eventId: command.commandId,
-          expiresAt: new Date(push.expires * 1000).toISOString(), timestamp: seconds,
-          alert: { title: "nigeyo", body: push.payload.aps.alert.body }, language: activity.language,
-          regionalAlert: push.payload.regionalAlert }),
-      });
-      log("regional-activity-result", { status: result.apnsStatus, eventId: command.commandId });
-      if (result.accepted) startedActivities.set(command.commandId, push.expires);
-      activitySettled = result.accepted || result.error === "activity_payload_too_large" ||
-        (result.apnsStatus >= 400 && result.apnsStatus < 500 && result.apnsStatus !== 429);
-    }
-    const status = await notification;
-    if (status === 200) acceptedNotifications.set(command.commandId, push.expires);
-    log("regional-apns-result", { status, eventId: command.commandId });
-    if ((status === 200 || (status >= 400 && status < 500 && status !== 429)) && activitySettled && await ending) {
-      await monitor.acknowledge(installation, command.commandId);
-    }
+    return token;
   }
 
-  async function endActivity(device, command, timestamp, language) {
-    const update = await activityUpdateSource(device, command.hazard);
-    if (!update) return false;
-    if (Date.parse(update.issuedAt) > Date.parse(command.issuedAt)) return true;
-    if (command.hazard === "earthquake" && update.sourceEventId !== command.sourceEventId) return false;
-    const result = await sendActivity({ send, config, jwt: token, token: update.token,
-      eventId: command.commandId, expires: timestamp + 60,
-      payload: { aps: { timestamp, event: "end", "dismissal-date": timestamp,
-        "content-state": { ...activityContent(command.hazard, language, false), interactive: false },
-      } },
-    });
-    log("regional-activity-end-result", { status: result.apnsStatus, eventId: command.commandId });
-    return result.accepted || result.apnsStatus === 410;
+  async function deliver(installation, device, command, fingerprint) {
+    const finish = () => monitor.acknowledge(installation, command.commandId, command);
+    if (registry) {
+      const latest = await registry.get(device.id);
+      if (!latest?.subscription?.enabled) return finish();
+      device = { id: device.id, ...latest };
+    }
+    const subscription = subscriptionSource ? await subscriptionSource(device) : device.subscription;
+    if ((subscriptionSource || registry) && JSON.stringify(regionalSettings(subscription)) !== fingerprint) return finish();
+    const entry = monitor.currentDelivery(installation, command);
+    if (!entry || monitor.stopped) return;
+    const timestamp = now();
+    const deadline = Date.parse(command.issuedAt) + 120_000;
+    if (!(timestamp < deadline)) return finish();
+
+    const jwt = await signingToken(timestamp);
+    const push = buildRegionalPush(command, timestamp);
+    const activity = subscription?.activity;
+    const seconds = Math.floor(timestamp / 1000);
+    const current = () => !monitor.stopped && now() < deadline && monitor.currentDelivery(installation, command);
+    const shouldEnd = (activityUpdateSource || registry) && validActivityRegistration(activity) &&
+      (command.status === "cancelled" || (command.hazard === "tsunami" && command.grade === "Watch" &&
+        Object.values(command.tsunamiAreas ?? {}).every((grade) => ["Watch", "Cancelled"].includes(grade))));
+    const jobs = [];
+    const notify = push && Buffer.byteLength(JSON.stringify(push.payload)) <= 4096;
+    if (push && !notify) log("regional-apns-payload-too-large", { eventId: command.sourceEventId });
+    if (notify) {
+      jobs.push(["notification", device.deviceToken, () => send({
+        ":method": "POST",
+        ":path": `/3/device/${device.deviceToken}`,
+        "content-type": "application/json",
+        authorization: `bearer ${jwt}`,
+        [sensitiveHeaders]: ["authorization", ":path"],
+        "apns-topic": config.bundleId,
+        "apns-push-type": "alert",
+        "apns-priority": "10",
+        "apns-id": command.commandId,
+        "apns-collapse-id": command.commandId,
+        "apns-expiration": String(push.expires),
+      }, push.payload), undefined, device.deviceTokenGeneration]);
+      if (command.grade !== "Watch" && validActivityRegistration(activity)) {
+        jobs.push(activityJob("activityStart", activity.token, buildActivityStart({
+          hazard: command.hazard, eventId: command.commandId, expiresAt: new Date(push.expires * 1000).toISOString(),
+          timestamp: seconds, alert: { title: "nigeyo", body: push.payload.aps.alert.body },
+          language: activity.language, regionalAlert: push.payload.regionalAlert,
+        }), undefined, device.activityTokenGeneration));
+      }
+    }
+    if (shouldEnd && !entry.delivery?.activityEnd?.done) {
+      const update = registry ? device.activityUpdates?.[command.hazard] : await activityUpdateSource(device, command.hazard);
+      if (!update || (command.hazard === "earthquake" && update.sourceEventId !== command.sourceEventId)) {
+        jobs.push(["activityEnd"]);
+      } else if (Date.parse(update.issuedAt) <= Date.parse(command.issuedAt)) {
+        jobs.push(activityJob("activityEnd", update.token, { aps: {
+          timestamp: seconds, event: "end", "dismissal-date": seconds,
+          "content-state": { ...activityContent(command.hazard, activity.language, false), interactive: false },
+        } }, update.sessionId, update.generation));
+      }
+    }
+
+    function activityJob(channel, destination, payload, sessionId, tokenGeneration) {
+      return [channel, destination, async () => {
+        const response = await sendActivity({ send, config, jwt, token: destination, expires: Math.floor(deadline / 1000),
+          eventId: command.commandId, requestId: activityRequestId(command.commandId, channel), payload });
+        if (response.error === "activity_payload_too_large") return 413;
+        return { status: response.apnsStatus, reason: response.apnsReason, timestamp: response.timestamp,
+          retryAfterMs: response.retryAfterMs };
+      }, sessionId, tokenGeneration];
+    }
+
+    const settled = await Promise.all(jobs.map(async ([channel, destination, work, sessionId, tokenGeneration]) => {
+      const previous = entry.delivery?.[channel];
+      if (previous?.done) return true;
+      if (!work || previous?.retryAt > now() || !current()) return false;
+      let result;
+      try { result = classifyAPNs(await work()); }
+      catch { result = classifyAPNs(); }
+      const { status, reason, outcome, retryAfterMs } = result;
+      log("regional-delivery-result", { channel, status, reason, outcome, commandId: command.commandId,
+        eventId: command.sourceEventId, revision: command.sourceRevision });
+      const refreshExpired = reason === "ExpiredProviderToken" &&
+        (jwt !== token || Math.floor(now() / 1000) - tokenIssuedAt >= 1200);
+      if (refreshExpired && jwt === token) token = undefined;
+      const attempts = (previous?.attempts ?? 0) + 1;
+      // Apple recommends waiting 15 minutes before retrying an APNs 5xx response.
+      const retryDelay = Math.max(outcome === "apns-unavailable" ? 900_000 : 0,
+        Math.min(30_000, 5000 * 2 ** Math.min(attempts - 1, 3)), retryAfterMs ?? 0);
+      const retryable = ["transport", "rate-limited", "apns-unavailable"].includes(outcome) || refreshExpired;
+      const retryAt = now() + retryDelay;
+      const done = !retryable || retryAt >= deadline;
+      if (outcome === "invalid-token" && registry?.invalidate) {
+        await registry.invalidate(device.id, { channel, token: destination, tokenGeneration,
+          hazard: command.hazard, sessionId, timestamp: result.timestamp });
+      }
+      await monitor.recordDelivery(installation, command, channel, { outcome, done, attempts, ...(!done && { retryAt }) });
+      return done;
+    }));
+    if (!monitor.stopped && settled.every(Boolean)) await finish();
   }
 
   // Token rotations and language changes must not reset the monitor's deduplication history.
@@ -153,16 +240,31 @@ export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs,
 
   try {
     await monitor.load();
-    for (const id of Object.keys(monitor.records)) {
-      if (!installations.has(id)) await monitor.configure(id, disabledSubscription, () => {});
+    if (registry) await refreshRegistry();
+    else {
+      for (const id of Object.keys(monitor.records)) {
+        if (!installations.has(id)) await monitor.configure(id, disabledSubscription, () => {});
+      }
+      for (const [id, device] of installations) await configure(id, device);
     }
-    for (const [id, device] of installations) await configure(id, device);
   } catch (error) {
     monitor.stop();
     throw error;
   }
   if (subscriptionSource) void refreshSubscriptions();
   return monitor;
+
+  async function refreshRegistry() {
+    const devices = await registry.listDevices();
+    const active = new Set(devices.map((device) => device.id));
+    for (const id of Object.keys(monitor.records)) {
+      if (!active.has(id)) {
+        await monitor.forget(id);
+        subscriptions.delete(id);
+      }
+    }
+    for (const device of devices) await configure(device.id, device);
+  }
 
   async function configure(id, device) {
     const subscription = subscriptionSource ? await subscriptionSource(device) : device.subscription;
@@ -171,9 +273,10 @@ export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs,
     }
     const settings = regionalSettings(subscription);
     const fingerprint = JSON.stringify(settings);
-    if (subscriptions.get(id) === fingerprint) return;
+    const signature = registry ? JSON.stringify([fingerprint, device.deviceToken]) : fingerprint;
+    if (subscriptions.get(id) === signature) return;
     await monitor.configure(id, settings, (command) => dispatch(id, device, command, fingerprint));
-    subscriptions.set(id, fingerprint);
+    subscriptions.set(id, signature);
   }
 
   async function refreshSubscriptions() {
@@ -188,18 +291,39 @@ export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs,
   }
 }
 
+export function workerHealthServer(monitor) {
+  return createServer((_request, response) => {
+    response.writeHead(monitor.stopped ? 503 : 204).end();
+  });
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     const { SecretString } = await loadAPNsSecret();
-    const stateStore = createRegionalStateStore({ bucket: process.env.STATE_BUCKET });
-    const subscriptionSource = process.env.APP_REGISTRATION_ENABLED === "true"
+    const registry = process.env.INSTALLATION_TABLE ? installationStore(process.env.INSTALLATION_TABLE) : undefined;
+    const stateStore = registry?.state ?? createRegionalStateStore({ bucket: process.env.STATE_BUCKET });
+    const subscriptionSource = !registry && process.env.APP_REGISTRATION_ENABLED === "true"
       ? (device) => loadLiveSubscription(process.env.STATE_BUCKET, device)
       : undefined;
     const activityUpdateSource = subscriptionSource
       ? (device, hazard) => loadActivityUpdate(process.env.STATE_BUCKET, device, hazard)
       : undefined;
-    const monitor = await runRegionalWorker({ stateStore, secret: SecretString, subscriptionSource, activityUpdateSource });
-    process.on("SIGTERM", () => monitor.stop());
+    const monitor = await runRegionalWorker({ stateStore, secret: SecretString, subscriptionSource, activityUpdateSource, registry, refreshSigningSecret });
+    const health = workerHealthServer(monitor);
+    health.on("error", () => {
+      console.error("regional-worker-health-server-failed");
+      monitor.stop();
+      clearInterval(report);
+      resetAPNsConnection();
+      process.exitCode = 1;
+    });
+    health.listen(8080, "127.0.0.1");
+    process.on("SIGTERM", () => {
+      monitor.stop();
+      clearInterval(report);
+      health.close();
+      resetAPNsConnection();
+    });
   } catch {
     console.error("regional-worker-startup-failed");
     process.exitCode = 1;

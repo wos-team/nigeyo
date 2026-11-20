@@ -196,3 +196,35 @@ test('storage failure rolls back registration and never delivers an uncommitted 
   assert.deepEqual(monitor.records.nagoya.state, initialState());
   monitor.stop();
 });
+
+test('a silent feed reconnects without resetting its persisted warning revisions', async (t) => {
+  const sockets = [];
+  class SilentFeed extends FakeSocket {
+    constructor() {
+      super();
+      sockets.push(this);
+    }
+    ping() {}
+    terminate() { this.emit('close', 1006); }
+  }
+  const monitor = new RegionalMonitor({
+    stateStore: { load: async () => null, save: async () => {} },
+    WebSocketImpl: SilentFeed, now: () => now, alwaysConnect: true,
+    feedTiming: { pingMs: 5, retryMs: 5, maxRetryMs: 10, jitter: () => 0 },
+  });
+  t.after(() => monitor.stop());
+  await monitor.load();
+  const sent = [];
+  await monitor.configure('nagoya', subscription, (value) => sent.push(value));
+  sockets[0].emit('open');
+  await monitor.ingest(eew());
+  for (let attempt = 0; sockets.length < 2 && attempt < 20; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(sockets.length, 2);
+  sockets[1].emit('open');
+  sockets[1].emit('pong');
+  await monitor.ingest(eew());
+  assert.equal(sent.length, 1);
+  assert.equal(monitor.status('nagoya').state.eew.event.serial, 1);
+});

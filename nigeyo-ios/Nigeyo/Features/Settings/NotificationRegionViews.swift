@@ -34,7 +34,12 @@ struct NotificationRegionsView: View {
                     if updating {
                         ProgressView()
                     } else if enabled {
-                        Text(t["regions.registration.registered"]).font(.footnote)
+                        if LiveNotificationRegistration.status.isSynced {
+                            Text(t["regions.registration.registered"]).font(.footnote)
+                        } else {
+                            Text(t["regions.registration.unsynced"]).font(.footnote)
+                            Button(t["regions.registration.retry"]) { update(true) }
+                        }
                     } else if model.settings.liveRegistrationNeedsRevocation {
                         Button(t["regions.registration.revoke"]) { update(false) }
                     }

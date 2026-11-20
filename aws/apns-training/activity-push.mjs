@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { sensitiveHeaders } from "node:http2";
+import { classifyAPNs } from "./transport.mjs";
 
 const languages = Object.fromEntries(["en", "ja", "ko"].map((id) => [
   id, JSON.parse(readFileSync(new URL(`../../assets/languages/${id}.json`, import.meta.url))).strings,
@@ -48,10 +49,10 @@ export function buildActivityStart({ hazard, eventId, expiresAt, timestamp, aler
   };
 }
 
-export async function sendActivity({ send, config, jwt, token, expires, eventId, payload }) {
+export async function sendActivity({ send, config, jwt, token, expires, eventId, requestId = randomUUID(), payload }) {
   if (Buffer.byteLength(JSON.stringify(payload)) > 4096) return { accepted: false, error: "activity_payload_too_large" };
   try {
-    const status = await send({
+    const response = classifyAPNs(await send({
       ":method": "POST",
       ":path": `/3/device/${token}`,
       "content-type": "application/json",
@@ -60,11 +61,14 @@ export async function sendActivity({ send, config, jwt, token, expires, eventId,
       "apns-topic": `${config.bundleId}.push-type.liveactivity`,
       "apns-push-type": "liveactivity",
       "apns-priority": "10",
-      "apns-id": randomUUID(),
+      "apns-id": requestId,
       "apns-collapse-id": eventId,
       "apns-expiration": String(expires),
-    }, payload);
-    return { accepted: status === 200, apnsStatus: status };
+    }, payload));
+    const { status, reason, timestamp, retryAfterMs } = response;
+    return { accepted: status === 200, apnsStatus: status,
+      ...(reason && { apnsReason: reason }), ...(Number.isFinite(timestamp) && { timestamp }),
+      ...(Number.isFinite(retryAfterMs) && { retryAfterMs }) };
   } catch {
     return { accepted: false, error: "apns_transport_failed" };
   }

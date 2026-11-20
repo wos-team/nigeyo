@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font: 100%/1.55 system-ui, sans-serif; }
+body { margin: 0; }
+main { width: min(48rem, 92%); margin: 2rem auto; }
+section { margin-block: 1.25rem; padding: 1rem; border: 1px solid GrayText; border-radius: .5rem; }
+h2 { margin-block: 0 .5rem; font-size: 1.15rem; }
+form, .actions { display: flex; align-items: center; flex-wrap: wrap; gap: .65rem; }
+input, select, button { min-height: 2.5rem; font: inherit; }
+button { padding-inline: .75rem; }
+dl { display: grid; grid-template-columns: minmax(7rem, max-content) 1fr; gap: .35rem; }
+dd { margin: 0; }
+li { overflow-wrap: anywhere; }
+#confirm::backdrop { background: rgb(0 0 0 / .45); }
+#confirm p, #confirm h2 { flex-basis: 100%; }
+
+[hidden] { display: none !important; }

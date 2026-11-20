@@ -15,6 +15,7 @@ final class APNsRegistration {
     private(set) var state: State = .idle
 
     func register() {
+        if case .registering = state { return }
         state = .registering
         UIApplication.shared.registerForRemoteNotifications()
     }

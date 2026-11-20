@@ -27,3 +27,12 @@
 !assets/languages/en.json
 !assets/languages/ja.json
 !assets/languages/ko.json
+!aws/installation-store.mjs
+!aws/self-registration.mjs
+!aws/apns-training/transport.mjs
+!aws/worker-observability.mjs
+!aws/operations/
+!aws/operations/*.mjs
+!aws/operations/*.html
+!aws/operations/*.js
+!aws/operations/*.css

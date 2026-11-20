@@ -112,7 +112,16 @@ final class AppModel {
         let current = try? await services.store.snapshot()
         session = current
         await services.liveActivities.sync(current, foreground: true)
-        Task { await LiveNotificationRegistration.refreshActivity(settings: settings) }
+        Task {
+            if settings.liveRegistrationNeedsRevocation && settings.regionalSubscription.enabled {
+                if notificationAuthorization == .authorized {
+                    APNsRegistration.shared.register()
+                    await LiveNotificationRegistration.refreshActivity(settings: settings)
+                } else if notificationAuthorization == .denied {
+                    _ = await revokeLiveRegistrationIfNeeded()
+                }
+            }
+        }
         if reconnect, let pairing, services.settings.demoAutoConnect {
             // A suspended socket may still appear connected until the next I/O.
             await services.delivery.connect(pairing)

@@ -1,15 +1,17 @@
 import { createPrivateKey, randomUUID, sign } from "node:crypto";
-import { connect, sensitiveHeaders } from "node:http2";
+import { sensitiveHeaders } from "node:http2";
 import { GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 
 import { buildActivityStart, sendActivity, validActivityRegistration } from "./activity-push.mjs";
+import { classifyAPNs, createAPNsTransport } from "./transport.mjs";
 
 const drills = {
   earthquake: { title: "EARTHQUAKE_TEST", body: "【訓練】地震です。頭を守ってください。" },
   tsunami: { title: "TSUNAMI_TEST", body: "【訓練】津波です。高い場所へ避難してください。" },
 };
 const ttlSeconds = 120;
-const apnsOrigin = "https://api.push.apple.com";
+const transport = createAPNsTransport();
+export const resetAPNsConnection = () => transport.close();
 const secrets = new SecretsManagerClient({ maxAttempts: 1 });
 
 function isDeviceToken(value) {
@@ -27,18 +29,19 @@ function validTrainingRegions(regions) {
     Object.values(regions).every((areas) => Array.isArray(areas) && areas.every(isRegion));
 }
 
-export function readConfig(value, { requireRegions = false } = {}) {
+export function readConfig(value, { requireRegions = false, signingOnly = false } = {}) {
   const { teamId, keyId, privateKey, bundleId, deviceToken, devices } = JSON.parse(value);
   if (typeof teamId !== "string" || !/^[A-Z0-9]{10}$/.test(teamId) ||
       typeof keyId !== "string" || !/^[A-Z0-9]{10}$/.test(keyId) ||
       typeof bundleId !== "string" || !/^[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$/.test(bundleId) ||
-      (devices === undefined && !isDeviceToken(deviceToken))) {
+      (!signingOnly && devices === undefined && !isDeviceToken(deviceToken))) {
     throw new Error("Invalid APNs configuration");
   }
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "ec" || key.asymmetricKeyDetails.namedCurve !== "prime256v1") {
     throw new Error("Invalid APNs key type");
   }
+  if (signingOnly) return { teamId, keyId, key, bundleId };
   if (devices === undefined) return { teamId, keyId, key, bundleId, deviceToken };
 
   if (deviceToken !== undefined || !Array.isArray(devices) || devices.length < 1 || devices.length > 4) {
@@ -65,35 +68,19 @@ export function providerToken({ keyId, teamId, key }, issuedAt) {
   return `${claims}.${signature.toString("base64url")}`;
 }
 
-export function sendToAPNs(headers, payload, openConnection = connect) {
-  return new Promise((resolve, reject) => {
-    const connection = openConnection(apnsOrigin);
-    const timeout = setTimeout(() => connection.destroy(new Error("APNs request timed out")), 5000);
-    connection.once("error", reject);
-    connection.once("close", () => {
-      clearTimeout(timeout);
-      reject(new Error("APNs connection closed before the response"));
-    });
-
-    const request = connection.request(headers);
-    let status;
-    request.once("response", (response) => { status = response[":status"]; });
-    request.once("error", reject);
-    request.once("end", () => {
-      connection.close();
-      resolve(status);
-    });
-    request.resume();
-    request.end(JSON.stringify(payload));
-  });
+export async function sendToAPNs(headers, payload, openConnection) {
+  if (!openConnection) return transport.send(headers, payload);
+  const custom = createAPNsTransport({ openConnection });
+  try { return await custom.send(headers, payload); }
+  finally { custom.close(); }
 }
 
-export function makeHandler({ loadSecret, subscriptionSource, send = sendToAPNs, now = Date.now }) {
+export function makeHandler({ loadSecret, subscriptionSource, installationSource, send = sendToAPNs, now = Date.now }) {
   // Reuse the provider JWT across warm invocations. A new Secrets Manager version
   // invalidates the cache immediately without putting credentials in the environment.
   let cached;
   return async (event) => {
-    if (!event || Object.keys(event).some((key) => key !== "hazard" && key !== "region") || !Object.hasOwn(event, "hazard") ||
+    if (!event || Object.keys(event).some((key) => key !== "hazard" && key !== "region" && !(installationSource && key === "installationId")) || !Object.hasOwn(event, "hazard") ||
         typeof event.hazard !== "string" || !Object.hasOwn(drills, event.hazard)) {
       return { accepted: false, error: "expected_earthquake_or_tsunami" };
     }
@@ -101,6 +88,10 @@ export function makeHandler({ loadSecret, subscriptionSource, send = sendToAPNs,
       return { accepted: false, error: "invalid_training_region" };
     }
 
+    if (installationSource && (typeof event.installationId !== "string" ||
+        !/^[a-f0-9]{64}$/.test(event.installationId) || event.region !== undefined)) {
+      return { accepted: false, error: "training_installation_required" };
+    }
     const hazard = event.hazard;
     const eventId = randomUUID();
     let config;
@@ -110,7 +101,7 @@ export function makeHandler({ loadSecret, subscriptionSource, send = sendToAPNs,
       const secret = await loadSecret();
       issuedAt = Math.floor(now() / 1000);
       if (!cached || cached.version !== secret.VersionId || issuedAt >= cached.issuedAt + 45 * 60) {
-        config = readConfig(secret.SecretString, { requireRegions: !subscriptionSource });
+        config = readConfig(secret.SecretString, { requireRegions: !subscriptionSource, signingOnly: !!installationSource });
         jwt = providerToken(config, issuedAt);
         cached = { version: secret.VersionId, issuedAt, config, jwt };
       } else {
@@ -144,9 +135,10 @@ export function makeHandler({ loadSecret, subscriptionSource, send = sendToAPNs,
       };
       const notification = (async () => {
         try {
-          const status = await send(headers, payload);
-          if (!Number.isInteger(status)) throw new Error("APNs response had no status");
-          return { accepted: status === 200, apnsStatus: status };
+          const result = classifyAPNs(await send(headers, payload));
+          if (!Number.isInteger(result.status)) throw new Error("APNs response had no status");
+          return { accepted: result.outcome === "accepted", apnsStatus: result.status,
+            ...(result.reason && { apnsReason: result.reason }) };
         } catch {
           return { accepted: false, error: "apns_transport_failed" };
         }
@@ -159,6 +151,16 @@ export function makeHandler({ loadSecret, subscriptionSource, send = sendToAPNs,
       const [result, liveActivity] = await Promise.all([notification, activityPush]);
       return { ...result, liveActivity };
     };
+
+    if (installationSource) {
+      try {
+        const device = await installationSource(event.installationId);
+        if (!device?.subscription?.enabled) return { accepted: false, eventId, error: "installation_not_enabled" };
+        return { ...await sendDrill(device.deviceToken, undefined, eventId, device.subscription.activity), eventId };
+      } catch {
+        return { accepted: false, eventId, error: "installation_unavailable" };
+      }
+    }
 
     if (!config.devices && !subscriptionSource) {
       if (event.region) return { accepted: false, eventId, error: "regional_devices_not_configured" };
@@ -190,11 +192,20 @@ export function makeHandler({ loadSecret, subscriptionSource, send = sendToAPNs,
   };
 }
 
-export function loadAPNsSecret() {
+export function readAWSSecret(secretId) {
   return secrets.send(
-    new GetSecretValueCommand({ SecretId: process.env.APNS_SECRET_ARN }),
+    new GetSecretValueCommand({ SecretId: secretId }),
     { abortSignal: AbortSignal.timeout(3000) },
   );
+}
+
+export const loadAPNsSecret = () => readAWSSecret(process.env.APNS_SECRET_ARN);
+let signingSecret;
+export async function loadCachedAPNsSecret() {
+  if (signingSecret && Date.now() < signingSecret.expires) return signingSecret.value;
+  const value = await loadAPNsSecret();
+  signingSecret = { value, expires: Date.now() + 300_000 };
+  return value;
 }
 
 export const handler = makeHandler({ loadSecret: loadAPNsSecret });

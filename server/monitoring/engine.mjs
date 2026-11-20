@@ -65,8 +65,9 @@ export function evaluate(item, subscription, state = initialState(), { now = new
     grade = matches.map((m) => areas[m.region]).filter((g) => rank[g]).sort((a, b) => rank[b] - rank[a])[0] ?? null;
     status = item.cancelled ? 'cancelled' : !grade ? 'unknown' : 'active';
   }
-  const action = matches.length && (item.code === 552 || notify || status === 'cancelled') ? { type: 'regional-alert', commandId: uuid(), hazard: item.code === 556 ? 'earthquake' : 'tsunami',
+  const update = matches.length ? { type: 'regional-alert', commandId: uuid(), hazard: item.code === 556 ? 'earthquake' : 'tsunami',
     sourceEventId: item.code === 556 ? item.issue.eventId : item.id, issuedAt, status, grade, notify, matches,
     tsunamiAreas: item.code === 552 ? next.tsunami.areas : null, mode: 'live' } : null;
-  return { state: next, action, reason: action ? 'region-match' : 'outside-target-area' };
+  const action = item.code === 552 || notify || status === 'cancelled' ? update : null;
+  return { state: next, action, update, reason: action ? 'region-match' : 'outside-target-area' };
 }

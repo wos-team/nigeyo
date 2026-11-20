@@ -29,6 +29,18 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
+  SelfRegistrationEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+  OperationsSecretArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+)$'
+  OperationsAlarmTopicArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^(|arn:[a-z-]+:sns:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+)$'
   APNsSecretArn:
     Type: String
     Description: Full ARN of the existing Secrets Manager secret in this account and region.
@@ -39,6 +51,11 @@ Parameters:
     AllowedPattern: '^[a-zA-Z0-9_+=,.@-]{1,64}$'
 
 Rules:
+  RequireRegistrationApi:
+    RuleCondition: !Equals [!Ref SelfRegistrationEnabled, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref AppRegistrationEnabled, 'true']
+        AssertDescription: Enable AppRegistrationEnabled before enabling self registration.
   RequireLiveParameters:
     RuleCondition: !Or
       - !Equals [!Ref LiveEnabled, 'true']
@@ -60,14 +77,37 @@ Conditions:
     - !Condition ConfigureLiveMonitoring
     - !Equals [!Ref AppRegistrationEnabled, 'true']
 
+  SendOperationsAlarms: !Not [!Equals [!Ref OperationsAlarmTopicArn, '']]
+  ConfigureSelfRegistration: !And
+    - !Condition ConfigureAppRegistration
+    - !Equals [!Ref SelfRegistrationEnabled, 'true']
+
+  ConfigureOperations: !And
+    - !Condition ConfigureSelfRegistration
+    - !Not [!Equals [!Ref OperationsSecretArn, '']]
+
 Resources:
+  Installations:
+    Condition: ConfigureSelfRegistration
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      AttributeDefinitions:
+        - {AttributeName: kind, AttributeType: S}
+        - {AttributeName: id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: kind, KeyType: HASH}
+        - {AttributeName: id, KeyType: RANGE}
   LiveRegistrationApi:
     Condition: ConfigureAppRegistration
     Type: AWS::Serverless::HttpApi
     Properties:
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 5
-        ThrottlingRateLimit: 2
+        ThrottlingBurstLimit: !If [ConfigureSelfRegistration, 30, 5]
+        ThrottlingRateLimit: !If [ConfigureSelfRegistration, 15, 2]
   LiveRegistration:
     Condition: ConfigureAppRegistration
     Type: AWS::Serverless::Function
@@ -82,6 +122,7 @@ Resources:
         Variables:
           APNS_SECRET_ARN: !Ref LiveSecretArn
           STATE_BUCKET: !Ref RegionalState
+          INSTALLATION_TABLE: !If [ConfigureSelfRegistration, !Ref Installations, '']
       Policies:
         - AWSSecretsManagerGetSecretValuePolicy:
             SecretArn: !Ref LiveSecretArn
@@ -97,7 +138,38 @@ Resources:
             - Effect: Allow
               Action: s3:ListBucket
               Resource: !GetAtt RegionalState.Arn
+        - !If
+          - ConfigureSelfRegistration
+          - Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt Installations.Arn
+          - !Ref AWS::NoValue
       Events:
+        Enroll:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LiveRegistrationApi
+            Path: /v2/installations
+            Method: PUT
+        RemoveInstallation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LiveRegistrationApi
+            Path: /v2/installations
+            Method: DELETE
+        UpdateSubscription:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LiveRegistrationApi
+            Path: /v2/subscription
+            Method: PUT
+        UpdateActivity:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LiveRegistrationApi
+            Path: /v2/activity
+            Method: PUT
         Register:
           Type: HttpApi
           Properties:
@@ -124,6 +196,7 @@ Resources:
         Variables:
           APNS_SECRET_ARN: !If [ConfigureAppRegistration, !Ref LiveSecretArn, !Ref APNsSecretArn]
           STATE_BUCKET: !If [ConfigureAppRegistration, !Ref RegionalState, '']
+          INSTALLATION_TABLE: !If [ConfigureSelfRegistration, !Ref Installations, '']
       Policies:
         - Statement:
             - Effect: Allow
@@ -141,6 +214,52 @@ Resources:
                 Action: s3:ListBucket
                 Resource: !GetAtt RegionalState.Arn
           - !Ref AWS::NoValue
+
+        - !If
+          - ConfigureSelfRegistration
+          - Statement:
+              - Effect: Allow
+                Action: dynamodb:GetItem
+                Resource: !GetAtt Installations.Arn
+          - !Ref AWS::NoValue
+
+  Operations:
+    Condition: ConfigureOperations
+    Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: makefile}
+    Properties:
+      CodeUri: ..
+      Handler: aws/live-registration.operationsHandler
+      Runtime: nodejs24.x
+      Timeout: 15
+      Environment:
+        Variables:
+          APNS_SECRET_ARN: !Ref LiveSecretArn
+          INSTALLATION_TABLE: !Ref Installations
+          OPS_SECRET_ARN: !Ref OperationsSecretArn
+          OPS_ALLOW_SHORT_KEY: !If [EnableLiveMonitoring, 'false', 'true']
+      Policies:
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref OperationsSecretArn
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref LiveSecretArn
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem]
+              Resource: !GetAtt Installations.Arn
+      Events:
+        Dashboard:
+          Type: HttpApi
+          Properties: {ApiId: !Ref LiveRegistrationApi, Path: /ops, Method: GET}
+        Assets:
+          Type: HttpApi
+          Properties: {ApiId: !Ref LiveRegistrationApi, Path: '/ops/{asset}', Method: GET}
+        Status:
+          Type: HttpApi
+          Properties: {ApiId: !Ref LiveRegistrationApi, Path: /ops/api/status, Method: GET}
+        Drills:
+          Type: HttpApi
+          Properties: {ApiId: !Ref LiveRegistrationApi, Path: /ops/api/drills, Method: POST}
 
   OperatorInvokePolicy:
     Type: AWS::IAM::Policy
@@ -235,6 +354,12 @@ Resources:
                     - !Sub '${RegionalState.Arn}/subscriptions/*'
                     - !Sub '${RegionalState.Arn}/activity-updates/*'
                 - !Ref AWS::NoValue
+              - !If
+                - ConfigureSelfRegistration
+                - Effect: Allow
+                  Action: [dynamodb:GetItem, dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem]
+                  Resource: !GetAtt Installations.Arn
+                - !Ref AWS::NoValue
   WorkerTask:
     Condition: ConfigureLiveMonitoring
     Type: AWS::ECS::TaskDefinition
@@ -250,9 +375,24 @@ Resources:
           Image: !Ref WorkerImage
           Essential: true
           ReadonlyRootFilesystem: true
+          StopTimeout: 30
+          HealthCheck:
+            Command:
+              - CMD
+              - node
+              - -e
+              - >-
+                fetch('http://127.0.0.1:8080', { signal: AbortSignal.timeout(3000) }).then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))
+            StartPeriod: 30
+            Interval: 30
+            Timeout: 5
+            Retries: 3
           Environment:
             - {Name: APNS_SECRET_ARN, Value: !Ref LiveSecretArn}
             - {Name: STATE_BUCKET, Value: !Ref RegionalState}
+            - {Name: STACK_NAME, Value: !Ref 'AWS::StackName'}
+            - Name: INSTALLATION_TABLE
+              Value: !If [ConfigureSelfRegistration, !Ref Installations, '']
             - Name: APP_REGISTRATION_ENABLED
               Value: !If [ConfigureAppRegistration, 'true', 'false']
           LogConfiguration:
@@ -280,10 +420,76 @@ Resources:
           SecurityGroups: [!Ref WorkerSecurityGroup]
           Subnets: [!Ref PublicSubnet]
 
+  WorkerMissing:
+    Condition: ConfigureLiveMonitoring
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Worker heartbeat missing for three minutes.
+      Namespace: Nigeyo/Worker
+      MetricName: WorkerHeartbeat
+      Dimensions: [{Name: Environment, Value: !Ref 'AWS::StackName'}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: !If [EnableLiveMonitoring, breaching, notBreaching]
+      ActionsEnabled: !If [EnableLiveMonitoring, true, false]
+      AlarmActions: !If [SendOperationsAlarms, [!Ref OperationsAlarmTopicArn], !Ref 'AWS::NoValue']
+  FeedUnavailable:
+    Condition: ConfigureLiveMonitoring
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Feed down, delivery failures or stale pending alerts.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      ActionsEnabled: !If [EnableLiveMonitoring, true, false]
+      AlarmActions: !If [SendOperationsAlarms, [!Ref OperationsAlarmTopicArn], !Ref 'AWS::NoValue']
+      Metrics:
+        - Id: health
+          Expression: IF(feed >= 1 OR pending >= 30 OR failures >= 5 OR signing >= 1, 1, 0)
+          ReturnData: true
+        - Id: feed
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: Nigeyo/Worker, MetricName: FeedDown, Dimensions: [{Name: Environment, Value: !Ref 'AWS::StackName'}]}
+            Period: 60
+            Stat: Maximum
+        - Id: pending
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: Nigeyo/Worker, MetricName: OldestPendingSeconds, Dimensions: [{Name: Environment, Value: !Ref 'AWS::StackName'}]}
+            Period: 60
+            Stat: Maximum
+        - Id: failures
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: Nigeyo/Worker, MetricName: DeliveryFailures, Dimensions: [{Name: Environment, Value: !Ref 'AWS::StackName'}]}
+            Period: 60
+            Stat: Sum
+        - Id: signing
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: Nigeyo/Worker, MetricName: SigningFailures, Dimensions: [{Name: Environment, Value: !Ref 'AWS::StackName'}]}
+            Period: 60
+            Stat: Sum
+
 Outputs:
+  OperationsUrl:
+    Condition: ConfigureOperations
+    Value: !Sub 'https://${LiveRegistrationApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/ops'
   LiveRegistrationUrl:
     Condition: ConfigureAppRegistration
-    Value: !Sub 'https://${LiveRegistrationApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/subscription'
+    Value: !If
+      - ConfigureSelfRegistration
+      - !Sub 'https://${LiveRegistrationApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/v2/subscription'
+      - !Sub 'https://${LiveRegistrationApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/subscription'
+  InstallationTableName:
+    Condition: ConfigureSelfRegistration
+    Value: !Ref Installations
   ClusterName:
     Condition: ConfigureLiveMonitoring
     Value: !Ref Cluster

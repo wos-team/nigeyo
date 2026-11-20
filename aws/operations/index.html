@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ニゲヨ 運用画面</title>
+  <link rel="stylesheet" href="/ops/dashboard.css">
+  <script src="/ops/dashboard.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>ニゲヨ 運用画面</h1>
+  <form id="login">
+    <label for="key">運用キー</label>
+    <input id="key" type="password" required maxlength="64" autocomplete="off">
+    <button type="submit">接続</button>
+  </form>
+  <p id="message" role="status"></p>
+  <div id="dashboard" hidden>
+    <div class="actions"><button id="refresh">更新</button><button id="logout">切断</button></div>
+    <section aria-labelledby="overview-title">
+      <h2 id="overview-title">稼働状況</h2>
+      <dl><dt>登録端末</dt><dd id="registered"></dd><dt>監視</dt><dd id="feed"></dd><dt>送信待ち</dt><dd id="pending"></dd></dl>
+    </section>
+    <section aria-labelledby="region-title">
+      <h2 id="region-title">地域別購読数</h2>
+      <ul id="regions"></ul>
+    </section>
+    <section aria-labelledby="delivery-title">
+      <h2 id="delivery-title">最近の配信</h2>
+      <p>受付数はAPNsが受け付けた件数です。iPhoneでの表示は訓練で確認してください。</p>
+      <p id="delivery-counts"></p><ul id="delivery"></ul>
+    </section>
+    <section aria-labelledby="drill-title">
+      <h2 id="drill-title">訓練通知</h2>
+      <form id="drill">
+        <label for="target">テスト端末</label><select id="target" required></select>
+        <label for="hazard">災害種別</label><select id="hazard"><option value="earthquake">地震</option><option value="tsunami">津波</option></select>
+        <button id="preview" type="submit">送信内容を確認</button>
+      </form>
+      <ul id="drills"></ul>
+    </section>
+  </div>
+  <dialog id="confirm">
+    <form method="dialog">
+      <h2>訓練通知を送信</h2>
+      <p id="confirmation"></p>
+      <button value="cancel">戻る</button><button value="send">訓練を送信</button>
+    </form>
+  </dialog>
+</main>
+</body>
+</html>

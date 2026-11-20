@@ -1,8 +1,12 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { createOperationsHandler } from "./operations/handler.mjs";
 import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { loadAPNsSecret, makeHandler, readConfig } from "./apns-training/index.mjs";
+import { readAWSSecret, loadAPNsSecret, loadCachedAPNsSecret, makeHandler, readConfig } from "./apns-training/index.mjs";
 import { validActivityRegistration } from "./apns-training/activity-push.mjs";
 import { validSubscription } from "../server/monitoring/regions.mjs";
+
+import { installationStore } from "./installation-store.mjs";
+import { selfRegistrationHandler } from "./self-registration.mjs";
 
 const client = new S3Client({});
 export const disabledSubscription = { version: 2, enabled: false, targets: [] };
@@ -56,7 +60,7 @@ export function registrationHandler({ getDevices, save, saveActivity }) {
   };
 }
 
-export const handler = registrationHandler({
+const legacyHandler = registrationHandler({
   saveActivity: saveUpdateToken,
   getDevices: async () => {
     const { SecretString } = await loadAPNsSecret();
@@ -69,12 +73,35 @@ export const handler = registrationHandler({
   })),
 });
 
+const installationTable = process.env.INSTALLATION_TABLE;
+const store = installationTable ? installationStore(installationTable) : null;
+const registerSelf = store && selfRegistrationHandler(store, { validUpdateToken });
+
+export const handler = (event) => {
+  if (event.rawPath?.startsWith("/v2/")) return registerSelf ? registerSelf(event) : { statusCode: 404 };
+  return installationTable ? { statusCode: 410 } : legacyHandler(event);
+};
+
 export const trainingHandler = makeHandler({
-  loadSecret: loadAPNsSecret,
+  installationSource: store ? (id) => store.get(id) : undefined,
+  loadSecret: store ? loadCachedAPNsSecret : loadAPNsSecret,
   subscriptionSource: process.env.STATE_BUCKET
     ? (device) => loadLiveSubscription(process.env.STATE_BUCKET, device)
     : undefined,
 });
+
+let opsConfig;
+async function loadOperationsConfig() {
+  if (opsConfig && Date.now() < opsConfig.expires) return opsConfig.value;
+  const result = await readAWSSecret(process.env.OPS_SECRET_ARN);
+  const value = JSON.parse(result.SecretString);
+  opsConfig = { value, expires: Date.now() + 60_000 };
+  return value;
+}
+
+export const operationsHandler = store && process.env.OPS_SECRET_ARN ?
+  createOperationsHandler({ loadConfig: loadOperationsConfig, store, training: trainingHandler,
+    allowShortKey: process.env.OPS_ALLOW_SHORT_KEY === "true" }) : undefined;
 
 function updateTokenKey(device, hazard) {
   return `activity-updates/${deviceFingerprint(device)}/${hazard}.json`;

@@ -3,7 +3,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import { createRegionalStateStore } from "./regional-state.mjs";
-import { runRegionalWorker } from "./regional-worker.mjs";
+import { runRegionalWorker, workerHealthServer } from "./regional-worker.mjs";
 
 test("feed events reach APNs only for fresh, matching live warnings", async (t) => {
   let snapshot;
@@ -41,7 +41,11 @@ test("feed events reach APNs only for fresh, matching live warnings", async (t) 
   const start = () => runRegionalWorker({
     stateStore: createRegionalStateStore({ bucket: "test", client }),
     secret, WebSocketImpl: Feed, now: () => now,
-    send: async (headers, payload) => { sent.push({ headers, payload }); return status; }, log: () => {},
+    send: async (headers, payload) => {
+      sent.push({ headers, payload });
+      if (status === 503) throw new Error("temporary transport failure");
+      return status;
+    }, log: () => {},
   });
   let monitor = await start();
   t.after(() => monitor.stop());
@@ -93,7 +97,9 @@ test("feed events reach APNs only for fresh, matching live warnings", async (t) 
   assert.equal(monitor.status("aws-demo-device").pending, 1);
   monitor.stop();
   status = 200;
+  now += 5_000;
   monitor = await start();
+  await new Promise((resolve) => setImmediate(resolve));
   await monitor.queue;
   assert.equal(sent.length, 4);
   assert.equal(sent.at(-1).headers["apns-id"], pendingId);
@@ -106,4 +112,16 @@ test("feed events reach APNs only for fresh, matching live warnings", async (t) 
   monitor = await start();
   assert.equal(sent.length, 5);
 
+});
+
+
+test("the ECS loopback probe returns healthy only while the worker is running", async (t) => {
+  const monitor = { stopped: false };
+  const health = workerHealthServer(monitor);
+  t.after(() => health.close());
+  await new Promise((resolve) => health.listen(0, "127.0.0.1", resolve));
+  const address = "http://127.0.0.1:" + health.address().port;
+  assert.equal((await fetch(address)).status, 204);
+  monitor.stopped = true;
+  assert.equal((await fetch(address)).status, 503);
 });

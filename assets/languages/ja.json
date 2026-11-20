@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "packageVersion": 8,
+  "packageVersion": 9,
   "languageId": "ja",
   "displayName": "Japanese",
   "nativeName": "日本語",
@@ -367,6 +367,8 @@
     "regions.shortcuts.live-earthquake": "本番用の地震ショートカットをダウンロード",
     "regions.shortcuts.live-tsunami": "本番用の津波ショートカットをダウンロード",
     "regions.shortcuts.help": "追加後、ショートカットアプリで各通知オートメーションの対象をNigeyoに設定し、「すぐに実行」を選びます。各iPhoneで初回の壁紙変更を許可してください。",
+    "regions.registration.unsynced": "通知設定がまだ同期されていません。",
+    "regions.registration.retry": "同期を再試行",
     "regions.registration.registered": "本番通知の配信先に登録済み",
     "regions.registration.revoke": "本番通知の登録を解除する",
     "regions.registration.unavailable": "このビルドには本番通知の登録先が設定されていません。",
