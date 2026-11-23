@@ -260,3 +260,87 @@ test("a restarted worker resumes only the unfinished APNs channel and cancels an
   await waitForReceipts();
   assert.equal(requests.length, 5, "cancelled activity-start is never retried");
 });
+
+test("Android opt-in uses a private inbox and expires and revokes queued drills", async () => {
+  const store = installationStore("test", localDatabase());
+  const options = { validUpdateToken: () => true };
+  const disabled = selfRegistrationHandler(store, options);
+  const enabled = selfRegistrationHandler(store, { ...options, androidEnabled: true });
+  const credential = JSON.parse((await request(enabled, "installations", "PUT", "a".repeat(64))).body).credential;
+  const other = JSON.parse((await request(enabled, "installations", "PUT", "b".repeat(64))).body).credential;
+  const installationId = credential.split(".")[0];
+  const body = { ...subscription, platform: "android" };
+  assert.equal((await request(disabled, "subscription", "PUT", credential, body)).statusCode, 400);
+  assert.equal((await request(enabled, "subscription", "PUT", credential, {
+    ...body, activity: { token: "aa".repeat(32), language: "en" },
+  })).statusCode, 400);
+  assert.equal((await request(enabled, "subscription", "PUT", credential, body)).statusCode, 204);
+  assert.equal((await request(enabled, "subscription", "PUT", other, body)).statusCode, 204);
+  const timestamp = Date.now();
+  const drill = makeHandler({
+    loadSecret: () => assert.fail("Android drill must not use APNs"),
+    installationSource: (id) => store.get(id),
+    publishAndroid: store.publishAndroid,
+    now: () => timestamp,
+  });
+  const result = await drill({ hazard: "tsunami", installationId });
+  assert.equal(result.accepted, true, result.error);
+  assert.equal(result.delivery, "android-inbox");
+  const poll = async (auth) => JSON.parse((await request(enabled, "alerts", "GET", auth)).body).alerts;
+  assert.deepEqual(await poll(credential), [{
+    nigeyoType: "remote-training", eventId: result.eventId, hazard: "tsunami",
+    expiresAt: new Date(timestamp + 120_000).toISOString(),
+  }]);
+  assert.deepEqual(await poll(other), []);
+  assert.deepEqual(await store.pollAndroid(installationId, credential.split(".")[1], timestamp + 121_000), []);
+  assert.equal((await request(enabled, "installations", "DELETE", credential)).statusCode, 204);
+  assert.equal((await request(enabled, "alerts", "GET", credential)).statusCode, 403);
+  assert.equal((await drill({ hazard: "earthquake", installationId })).accepted, false);
+});
+
+test("worker writes Android warnings and cancellation to the scoped queue without sending APNs", async (t) => {
+  const store = installationStore("test", localDatabase());
+  const handler = selfRegistrationHandler(store, { androidEnabled: true, validUpdateToken: () => false });
+  const credential = JSON.parse((await request(handler, "installations", "PUT", "a".repeat(64))).body).credential;
+  const [id, secretToken] = credential.split(".");
+  assert.equal((await request(handler, "subscription", "PUT", credential, { ...subscription, platform: "android" })).statusCode, 204);
+  const { privateKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const secret = JSON.stringify({ teamId: "TEAM123456", keyId: "KEY1234567", bundleId: "jp.nigeyo.hackathon",
+    privateKey: privateKey.export({ format: "pem", type: "pkcs8" }) });
+  let clock = Date.now() + 1000;
+  class Feed extends EventEmitter { terminate() {} }
+  const apns = [];
+  const monitor = await runRegionalWorker({
+    stateStore: store.state, registry: store, publishAndroid: store.publishAndroid,
+    WebSocketImpl: Feed, now: () => clock, log: () => {}, secret,
+    send: async (headers) => { apns.push(headers); return 200; },
+  });
+  t.after(() => monitor.stop());
+  const jst = () => new Date(clock).toLocaleString("sv-SE", { timeZone: "Asia/Tokyo" }).replaceAll("-", "/");
+  const publish = async (cancelled) => {
+    const item = {
+      code: 556, id: cancelled ? "cancel" : "quake", cancelled, areas: cancelled ? [] : [area],
+      issue: { time: jst(), eventId: "fixture", serial: cancelled ? "2" : "1" },
+    };
+    monitor.ws.emit("message", Buffer.from(JSON.stringify(item)), false);
+    await monitor.feedQueue;
+    await new Promise((resolve) => setImmediate(resolve));
+    await monitor.queue;
+  };
+  await publish(false);
+  const pending = await store.pollAndroid(id, secretToken, clock);
+  assert.equal(pending.length, 1);
+  const active = JSON.parse(pending[0].regionalAlert);
+  assert.equal(active.schemaVersion, 2);
+  assert.equal(active.notify, true);
+  assert.equal(active.status, "active");
+  assert.equal(active.matches[0].region, area.name);
+  clock += 1000;
+  await publish(true);
+  const after = await store.pollAndroid(id, secretToken, clock);
+  assert.equal(after.length, 1);
+  const cancelled = JSON.parse(after[0].regionalAlert);
+  assert.equal(cancelled.notify, false);
+  assert.equal(cancelled.status, "cancelled");
+  assert.deepEqual(apns, []);
+});

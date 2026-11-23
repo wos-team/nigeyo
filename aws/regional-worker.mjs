@@ -60,7 +60,7 @@ function activityRequestId(commandId, channel) {
   return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join("-");
 }
 
-export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs, WebSocketImpl, now = Date.now, log = console.log, subscriptionSource, activityUpdateSource, registry, refreshSigningSecret }) {
+export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs, publishAndroid, WebSocketImpl, now = Date.now, log = console.log, subscriptionSource, activityUpdateSource, registry, refreshSigningSecret }) {
   let config = readConfig(secret, { signingOnly: !!registry });
   const devices = registry ? [] : config.devices ?? [{ deviceToken: config.deviceToken, subscription: JSON.parse(secret).subscription }];
   const installations = new Map(devices.map((device) => [
@@ -148,7 +148,9 @@ export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs,
     const deadline = Date.parse(command.issuedAt) + 120_000;
     if (!(timestamp < deadline)) return finish();
 
-    const jwt = await signingToken(timestamp);
+    const android = device.platform === "android";
+    if (android && !publishAndroid) return finish();
+    const jwt = android ? null : await signingToken(timestamp);
     const push = buildRegionalPush(command, timestamp);
     const activity = subscription?.activity;
     const seconds = Math.floor(timestamp / 1000);
@@ -159,7 +161,17 @@ export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs,
     const jobs = [];
     const notify = push && Buffer.byteLength(JSON.stringify(push.payload)) <= 4096;
     if (push && !notify) log("regional-apns-payload-too-large", { eventId: command.sourceEventId });
-    if (notify) {
+    if (android) {
+      const { delivery: _delivery, ...publicCommand } = command;
+      const regionalAlert = push?.payload.regionalAlert ?? JSON.stringify({
+        ...publicCommand, notify: false, sentAt: new Date(timestamp).toISOString(),
+        expiresAt: new Date(deadline).toISOString(),
+      });
+      jobs.push(["notification", device.deviceToken, async () =>
+        await publishAndroid(device.id, command.hazard, {
+          nigeyoType: "regional-alert", regionalAlert,
+        }, deadline, timestamp) ? 200 : 400, undefined, device.deviceTokenGeneration]);
+    } else if (notify) {
       jobs.push(["notification", device.deviceToken, () => send({
         ":method": "POST",
         ":path": `/3/device/${device.deviceToken}`,
@@ -211,7 +223,7 @@ export async function runRegionalWorker({ stateStore, secret, send = sendToAPNs,
       try { result = classifyAPNs(await work()); }
       catch { result = classifyAPNs(); }
       const { status, reason, outcome, retryAfterMs } = result;
-      log("regional-delivery-result", { channel, status, reason, outcome, commandId: command.commandId,
+      log("regional-delivery-result", { channel, ...(android && { provider: "android-inbox" }), status, reason, outcome, commandId: command.commandId,
         eventId: command.sourceEventId, revision: command.sourceRevision });
       const refreshExpired = reason === "ExpiredProviderToken" &&
         (jwt !== token || Math.floor(now() / 1000) - tokenIssuedAt >= 1200);
@@ -308,7 +320,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const activityUpdateSource = subscriptionSource
       ? (device, hazard) => loadActivityUpdate(process.env.STATE_BUCKET, device, hazard)
       : undefined;
-    const monitor = await runRegionalWorker({ stateStore, secret: SecretString, subscriptionSource, activityUpdateSource, registry, refreshSigningSecret });
+    const publishAndroid = process.env.ANDROID_DELIVERY_ENABLED === "true"
+      ? registry?.publishAndroid : undefined;
+    const monitor = await runRegionalWorker({
+      stateStore, secret: SecretString, subscriptionSource, activityUpdateSource, registry,
+      refreshSigningSecret: loadAPNsSecret, publishAndroid,
+    });
     const health = workerHealthServer(monitor);
     health.on("error", () => {
       console.error("regional-worker-health-server-failed");

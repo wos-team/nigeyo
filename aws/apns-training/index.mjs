@@ -75,7 +75,7 @@ export async function sendToAPNs(headers, payload, openConnection) {
   finally { custom.close(); }
 }
 
-export function makeHandler({ loadSecret, subscriptionSource, installationSource, send = sendToAPNs, now = Date.now }) {
+export function makeHandler({ loadSecret, subscriptionSource, installationSource, send = sendToAPNs, publishAndroid, now = Date.now }) {
   // Reuse the provider JWT across warm invocations. A new Secrets Manager version
   // invalidates the cache immediately without putting credentials in the environment.
   let cached;
@@ -94,6 +94,25 @@ export function makeHandler({ loadSecret, subscriptionSource, installationSource
     }
     const hazard = event.hazard;
     const eventId = randomUUID();
+    let installation;
+    if (installationSource) {
+      try { installation = await installationSource(event.installationId); }
+      catch { return { accepted: false, eventId, error: "installation_unavailable" }; }
+      if (!installation?.subscription?.enabled) return { accepted: false, eventId, error: "installation_not_enabled" };
+      if (installation.platform === "android") {
+        if (!publishAndroid) return { accepted: false, eventId, error: "android_delivery_disabled" };
+        const timestamp = now();
+        const expires = timestamp + ttlSeconds * 1_000;
+        try {
+          const accepted = await publishAndroid(event.installationId, "training", {
+            nigeyoType: "remote-training", eventId, hazard, expiresAt: new Date(expires).toISOString(),
+          }, expires, timestamp);
+          return { accepted, eventId, delivery: "android-inbox" };
+        } catch {
+          return { accepted: false, eventId, error: "android_inbox_failed" };
+        }
+      }
+    }
     let config;
     let jwt;
     let issuedAt;
@@ -152,14 +171,8 @@ export function makeHandler({ loadSecret, subscriptionSource, installationSource
       return { ...result, liveActivity };
     };
 
-    if (installationSource) {
-      try {
-        const device = await installationSource(event.installationId);
-        if (!device?.subscription?.enabled) return { accepted: false, eventId, error: "installation_not_enabled" };
-        return { ...await sendDrill(device.deviceToken, undefined, eventId, device.subscription.activity), eventId };
-      } catch {
-        return { accepted: false, eventId, error: "installation_unavailable" };
-      }
+    if (installation) {
+      return { ...await sendDrill(installation.deviceToken, undefined, eventId, installation.subscription.activity), eventId };
     }
 
     if (!config.devices && !subscriptionSource) {

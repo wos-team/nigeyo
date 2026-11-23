@@ -51,6 +51,46 @@ export function installationStore(tableName, client = new DynamoDBClient({})) {
   const destination = (record) => record.invalidActivityToken === record.subscription.activity?.token &&
       record.subscription.activity ? { ...record, subscription: { ...record.subscription, activity: undefined } } : record;
   return {
+    async publishAndroid(id, channel, payload, expires, timestamp = Date.now()) {
+      if (!["earthquake", "tsunami", "training"].includes(channel) || expires <= timestamp) return false;
+      const record = await get("installation", id);
+      if (record?.platform !== "android" || !deliverable(record)) return false;
+      const inboxId = id + "#" + channel;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const previous = await get("android-alert", inboxId);
+        if (previous?.publishedAt > timestamp) return true;
+        let delivered = payload;
+        if (channel !== "training" && previous?.expiresAt * 1000 > timestamp && previous.payload?.regionalAlert) {
+          const prior = JSON.parse(previous.payload.regionalAlert);
+          const next = JSON.parse(payload.regionalAlert);
+          if (prior.notify && next.status === "active" && next.grade === prior.grade &&
+              next.sourceEventId === prior.sourceEventId && !next.notify) {
+            delivered = { ...payload, regionalAlert: JSON.stringify({ ...next, notify: true }) };
+          }
+        }
+        const value = { payload: delivered, publishedAt: timestamp, expiresAt: Math.ceil(expires / 1000), revision: randomUUID() };
+        const condition = previous ? {
+          ConditionExpression: "revision = :revision",
+          ExpressionAttributeValues: { ":revision": { S: previous.revision } },
+        } : { ConditionExpression: "attribute_not_exists(id)" };
+        try {
+          await put("android-alert", inboxId, value, condition);
+          return true;
+        } catch (error) {
+          if (!conditionalFailure(error)) throw error;
+        }
+      }
+      throw new Error("Concurrent Android delivery");
+    },
+    async pollAndroid(id, credential, now = Date.now()) {
+      const record = await get("installation", id);
+      if (!authorized(record, credential) || !record.subscription?.enabled || record.platform !== "android") return null;
+      const entries = await Promise.all(["earthquake", "tsunami", "training"].map((channel) =>
+        get("android-alert", id + "#" + channel)));
+      return entries.filter((entry) => entry && entry.expiresAt * 1000 > now &&
+        entry.publishedAt >= (record.deviceTokenUpdatedAt ?? 0))
+        .sort((a, b) => a.publishedAt - b.publishedAt).map(({ payload }) => payload);
+    },
     async invalidate(id, { channel, token, tokenGeneration, hazard, sessionId, timestamp }) {
       for (let attempt = 0; attempt < 4; attempt++) {
         const current = await get("installation", id);

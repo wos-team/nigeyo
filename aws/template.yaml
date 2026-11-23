@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: Nigeyo training and live regional APNs for opted-in iPhones.
+Description: Nigeyo training and live regional notifications for opted-in devices.
 
 Parameters:
   WorkerImage:
@@ -33,6 +33,10 @@ Parameters:
     Type: String
     Default: 'false'
     AllowedValues: ['true', 'false']
+  AndroidDeliveryEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
   OperationsSecretArn:
     Type: String
     Default: ''
@@ -51,6 +55,11 @@ Parameters:
     AllowedPattern: '^[a-zA-Z0-9_+=,.@-]{1,64}$'
 
 Rules:
+  RequireAndroidRegistration:
+    RuleCondition: !Equals [!Ref AndroidDeliveryEnabled, 'true']
+    Assertions:
+      - Assert: !Equals [!Ref SelfRegistrationEnabled, 'true']
+        AssertDescription: Enable SelfRegistrationEnabled before enabling Android delivery.
   RequireRegistrationApi:
     RuleCondition: !Equals [!Ref SelfRegistrationEnabled, 'true']
     Assertions:
@@ -85,6 +94,10 @@ Conditions:
   ConfigureOperations: !And
     - !Condition ConfigureSelfRegistration
     - !Not [!Equals [!Ref OperationsSecretArn, '']]
+
+  ConfigureAndroidDelivery: !And
+    - !Condition ConfigureSelfRegistration
+    - !Equals [!Ref AndroidDeliveryEnabled, 'true']
 
 Resources:
   Installations:
@@ -121,6 +134,7 @@ Resources:
       Environment:
         Variables:
           APNS_SECRET_ARN: !Ref LiveSecretArn
+          ANDROID_DELIVERY_ENABLED: !Ref AndroidDeliveryEnabled
           STATE_BUCKET: !Ref RegionalState
           INSTALLATION_TABLE: !If [ConfigureSelfRegistration, !Ref Installations, '']
       Policies:
@@ -170,6 +184,12 @@ Resources:
             ApiId: !Ref LiveRegistrationApi
             Path: /v2/activity
             Method: PUT
+        PollAndroidAlerts:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref LiveRegistrationApi
+            Path: /v2/alerts
+            Method: GET
         Register:
           Type: HttpApi
           Properties:
@@ -195,6 +215,7 @@ Resources:
       Environment:
         Variables:
           APNS_SECRET_ARN: !If [ConfigureAppRegistration, !Ref LiveSecretArn, !Ref APNsSecretArn]
+          ANDROID_DELIVERY_ENABLED: !Ref AndroidDeliveryEnabled
           STATE_BUCKET: !If [ConfigureAppRegistration, !Ref RegionalState, '']
           INSTALLATION_TABLE: !If [ConfigureSelfRegistration, !Ref Installations, '']
       Policies:
@@ -219,7 +240,7 @@ Resources:
           - ConfigureSelfRegistration
           - Statement:
               - Effect: Allow
-                Action: dynamodb:GetItem
+                Action: !If [ConfigureAndroidDelivery, [dynamodb:GetItem, dynamodb:PutItem], dynamodb:GetItem]
                 Resource: !GetAtt Installations.Arn
           - !Ref AWS::NoValue
 
@@ -235,6 +256,7 @@ Resources:
       Environment:
         Variables:
           APNS_SECRET_ARN: !Ref LiveSecretArn
+          ANDROID_DELIVERY_ENABLED: !Ref AndroidDeliveryEnabled
           INSTALLATION_TABLE: !Ref Installations
           OPS_SECRET_ARN: !Ref OperationsSecretArn
           OPS_ALLOW_SHORT_KEY: !If [EnableLiveMonitoring, 'false', 'true']
@@ -389,6 +411,7 @@ Resources:
             Retries: 3
           Environment:
             - {Name: APNS_SECRET_ARN, Value: !Ref LiveSecretArn}
+            - {Name: ANDROID_DELIVERY_ENABLED, Value: !Ref AndroidDeliveryEnabled}
             - {Name: STATE_BUCKET, Value: !Ref RegionalState}
             - {Name: STACK_NAME, Value: !Ref 'AWS::StackName'}
             - Name: INSTALLATION_TABLE

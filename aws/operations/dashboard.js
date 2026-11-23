@@ -41,7 +41,8 @@ function render(data) {
     [time(row.timestamp), channel[row.channel], row.reason || row.outcome, row.eventId, row.commandId].filter(Boolean).join(" / ")));
   list(byId("drills"), data.drills.map((row) =>
     [time(row.timestamp), row.operator, row.target, row.hazard === "earthquake" ? "地震" : "津波",
-      ({ requested: "結果待ち", accepted: "APNs受付", failed: "失敗" })[row.state], row.apnsReason ?? row.error,
+      ({ requested: "結果待ち", accepted: row.delivery === "android-inbox" ? "Android配信待ち" : "APNs受付", failed: "失敗" })[row.state],
+      row.apnsReason ?? row.error,
       row.activityAccepted === undefined ? "" : row.activityAccepted ? "Live Activity受付" :
         "Live Activity失敗 " + (row.activityReason ?? row.activityStatus ?? "")].filter(Boolean).join(" / ")));
   const current = target.value;

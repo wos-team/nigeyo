@@ -75,7 +75,8 @@ const legacyHandler = registrationHandler({
 
 const installationTable = process.env.INSTALLATION_TABLE;
 const store = installationTable ? installationStore(installationTable) : null;
-const registerSelf = store && selfRegistrationHandler(store, { validUpdateToken });
+const androidEnabled = process.env.ANDROID_DELIVERY_ENABLED === "true";
+const registerSelf = store && selfRegistrationHandler(store, { validUpdateToken, androidEnabled });
 
 export const handler = (event) => {
   if (event.rawPath?.startsWith("/v2/")) return registerSelf ? registerSelf(event) : { statusCode: 404 };
@@ -83,6 +84,7 @@ export const handler = (event) => {
 };
 
 export const trainingHandler = makeHandler({
+  publishAndroid: androidEnabled && store ? store.publishAndroid : undefined,
   installationSource: store ? (id) => store.get(id) : undefined,
   loadSecret: store ? loadCachedAPNsSecret : loadAPNsSecret,
   subscriptionSource: process.env.STATE_BUCKET

@@ -79,6 +79,7 @@ export function createOperationsHandler({ loadConfig, store, training, allowShor
         const result = {
           ...entry, state: response.accepted ? "accepted" : "failed", eventId: response.eventId,
           error: response.error, apnsStatus: response.apnsStatus, apnsReason: response.apnsReason,
+          ...(response.delivery && { delivery: response.delivery }),
           ...(response.liveActivity && { activityAccepted: response.liveActivity.accepted,
             activityStatus: response.liveActivity.apnsStatus, activityReason: response.liveActivity.apnsReason }),
         };
